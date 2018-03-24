@@ -1,0 +1,8 @@
+/data
+.project
+.cproject
+/cmake-build-debug
+/cmake-build-release
+/Debug
+/Release
+/.idea
