@@ -14,7 +14,7 @@ if(EXISTS "/usr/local/include/clion_cuda_syntax.h") # adding syntax highligts to
 endif()
 
 find_package(Boost COMPONENTS filesystem system timer REQUIRED)
-find_package(OpenCV REQUIRED core imgproc imgcodecs highgui)
+find_package(OpenCV COMPONENTS core imgproc imgcodecs highgui REQUIRED )
 find_package(OpenMP)
 
 if (OPENMP_FOUND)
