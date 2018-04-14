@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 11)
 file(GLOB_RECURSE sources src/*.cpp src/*.cu)
 file(GLOB_RECURSE headers src/*.h)
 
-add_executable(${PROJECT_NAME} ${sources} ${headers})
+add_executable(${PROJECT_NAME} ${sources} ${headers} src/dominantTransition.cu src/dominantTransition.h)
 #set_property(TARGET ${PROJECT_NAME} PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 set_property(TARGET ${PROJECT_NAME} PROPERTY CUDA_STANDARD 11)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
@@ -26,7 +26,7 @@ if (OPENMP_FOUND)
 else()
     message(WARNING "OpenMP not found")
 endif()
-#set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_50,code=sm_50")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_50,code=sm_50")
 
 set(DEPENDENCY_INCLUDES
         ${OpenCV_INCLUDE_PATH}

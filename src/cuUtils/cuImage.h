@@ -20,8 +20,8 @@ namespace cu {
 		void malloc(int height, int width, int type, bool init_zero = false);
 
 		size_t row_size = 0;
+        size_t pitch_ = 0;
 	public:
-		size_t pitch = 0;
 		int width = 0;
 		int height = 0;
 		int type = 0;
@@ -35,6 +35,10 @@ namespace cu {
 		cv::Mat download() const;
 		cv::Mat downloadAsRGB(float multiplier = 1.0f);
 		void memset(unsigned char value);
+
+	    template <class T = unsigned char> size_t pitch() const {
+            return pitch_ / sizeof(T);
+        }
 	};
 }
 

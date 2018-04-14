@@ -11,7 +11,8 @@
 
 namespace dominant_colour {
     cv::Mat computeImageMeans(const std::vector<std::string> &files, int k);
-    void computeDominant(const std::vector<std::string> &files, const std::vector<cv::Vec3b> &centroids_);
+    void computeDominant(const std::vector<std::string> &files, const std::vector<cv::Vec3b> &centroids_, int swap_pos);
+    void computeDominantTemporal(const std::vector<std::string> &files, const std::vector<cv::Vec3b> &centroids_, const int swap_pos);
 
     // run the full pipeline and cache intermediate steps in the cache-dir
     void run(const std::string &path, const std::string &cache_path);

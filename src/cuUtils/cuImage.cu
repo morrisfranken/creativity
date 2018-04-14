@@ -52,7 +52,7 @@ namespace cu {
 		this->type = type;
 
 		row_size = dummy.step * width;
-		CUDA_CHECK_RETURN(cudaMallocPitch(&data, &pitch, row_size, height));
+		CUDA_CHECK_RETURN(cudaMallocPitch(&data, &pitch_, row_size, height));
 		if (init_zero)
 			this->memset(0);
 	}
@@ -64,13 +64,13 @@ namespace cu {
 		type = img.type();
 
 		row_size = img.step;
-		CUDA_CHECK_RETURN(cudaMallocPitch(&data, &pitch, row_size, height));
-		CUDA_CHECK_RETURN(cudaMemcpy2D(data, pitch, img.data, row_size, row_size, height, cudaMemcpyHostToDevice));
+		CUDA_CHECK_RETURN(cudaMallocPitch(&data, &pitch_, row_size, height));
+		CUDA_CHECK_RETURN(cudaMemcpy2D(data, pitch_, img.data, row_size, row_size, height, cudaMemcpyHostToDevice));
 	}
 
 	cv::Mat Image::download() const {
 		Mat res = Mat(height, width, type);
-		CUDA_CHECK_RETURN(cudaMemcpy2D(res.data, row_size, data, pitch, row_size, height, cudaMemcpyDeviceToHost));
+		CUDA_CHECK_RETURN(cudaMemcpy2D(res.data, row_size, data, pitch_, row_size, height, cudaMemcpyDeviceToHost));
 		return res;
 	}
 
@@ -84,13 +84,13 @@ namespace cu {
 		const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
 		const dim3 dimGrid((width + dimBlock.x - 1) / dimBlock.x, (height + dimBlock.y - 1) / dimBlock.y);
 
-		f32torgb <<< dimGrid, dimBlock >>> ((float *) p(), rgb->p(), pitch / sizeof(float), rgb->pitch, width, height, multiplier);
+		f32torgb <<< dimGrid, dimBlock >>> ((float *) p(), rgb->p(), pitch_ / sizeof(float), rgb->pitch_, width, height, multiplier);
 		CUDA_CHECK_RETURN(cudaPeekAtLastError());
 
 		return rgb->download();
 	}
 
 	void Image::memset(const unsigned char value) {
-		CUDA_CHECK_RETURN(cudaMemset2D(data, pitch, value, row_size, height));
+		CUDA_CHECK_RETURN(cudaMemset2D(data, pitch_, value, row_size, height));
 	}
 }

@@ -25,7 +25,12 @@ public:
 	cuSharedPointer(const cuSharedPointer& a);
 	cuSharedPointer& operator=(const cuSharedPointer& in);
 
-	unsigned char *p() const;
+//    unsigned char *p() const {
+//        return data;
+//    }
+	template <class T = unsigned char> T *p() const {
+	    return (T *)data;
+	}
 };
 
 #endif /* CUDAUTILS_H_ */

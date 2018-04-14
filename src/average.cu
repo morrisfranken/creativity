@@ -55,7 +55,7 @@ void average::run(const std::string &path) {
 			cu::Image gpuimg(img);
 			const float f_width = gpuimg.width / (float)gputotal.width;
 			const float f_height = gpuimg.height / (float)gputotal.height;
-			scale_add<<<dimGrid, dimBlock>>>(gpuimg.p(), (float *)gputotal.p(), gpuimg.pitch, gputotal.pitch / sizeof(float), gputotal.width, gputotal.height, f_width, f_height);
+			scale_add<<<dimGrid, dimBlock>>>(gpuimg.p(), gputotal.p<float>(), gpuimg.pitch(), gputotal.pitch<float>(), gputotal.width, gputotal.height, f_width, f_height);
             CUDA_CHECK_RETURN(cudaPeekAtLastError());
 
 			if (omp_get_thread_num() == 0) {

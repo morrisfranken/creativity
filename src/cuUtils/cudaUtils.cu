@@ -45,7 +45,7 @@ cuSharedPointer& cuSharedPointer::operator=(const cuSharedPointer& in) {
 	return *this;
 }
 
-unsigned char *cuSharedPointer::p() const {
-	return data;
-}
+//unsigned char *cuSharedPointer::p() const {
+//	return data;
+//}
 
