@@ -7,8 +7,8 @@
 using namespace std;
 
 int main(int argc, char* argv[]) {
-//	dominant_colour::run("/home/morris/Downloads/images", "../cache");
-    dominant_colour::runCached("../cache");
-//    dominantTransition::run("../results/dominant");
+//	dominant_colour::computeColors("/home/morris/Downloads/images", "../cache");
+    dominant_colour::runDominantExtaction("../cache");
+//    dominantTransition::computeColors("../results/dominant");
 	return 0;
 }

@@ -28,13 +28,15 @@
 using namespace std;
 using namespace cv;
 
-typedef uchar label_t;
+typedef uchar label_t;  // change this based on K; K < 256 : uchar, K < 65536 : ushort
 constexpr int label_cvtype = CV_8U;// TODO(morris) should be dynamic based on ^  like cv::Mat_<label_t>().type()
 
 constexpr int BLOCK_SIZE = 32;
-constexpr char cache_path_files[] = "files.raw";
-constexpr char cache_path_image_means[] = "image_means.raw";
+constexpr char cache_path_files[]        = "files.raw";
+constexpr char cache_path_image_means[]  = "image_means.raw";
 constexpr char cache_path_global_means[] = "global_means.raw";
+
+const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
 
 #pragma omp declare reduction(vec_int_plus  : std::vector<int>     : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<int>())) initializer(omp_priv = omp_orig)
 #pragma omp declare reduction(vec_int3_plus : std::vector<Vec3i>   : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<Vec3i>())) initializer(omp_priv = omp_orig)
@@ -188,35 +190,115 @@ __global__ void retrieve_result_dominant2(uchar *img, const uint *dominant, cons
     img[idx_img + 2] = centroids[dom_idx * 3 + 2];
 }
 
-///////////////////////////////////
+__global__ void transition_subtract(const uchar *src, uint *dst, const int pitch_src, const int pitch_dst, const int width, const int height) {
+    const int row  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
 
-void compute_centroid_cpu(const Mat &img, const cu::Image &labels_, cu::Vector<cv::Vec3b> &centroids_, const int k) {
-    const Mat labels = labels_.download();
-    std::vector<Vec3i> centroidsi(k);
-    std::vector<Vec3b> centroidsb(k);
-    std::vector<int> count(k);
+    if (col < width & row < height) {
+        const int idx_src = row * pitch_src + col * 3;
+        const int idx_dst = row * pitch_dst + col * 3;
 
-    // omp seem to only improve ~15% in local tests, not worth it considering vs image loading
-//#pragma omp parallel for reduction(vec_int3_plus : centroidsi), reduction(vec_int_plus : count)
-    for (int y = 0; y < labels.rows; y++) {
-        const Vec3b *row_img = reinterpret_cast<const Vec3b *>(img.ptr(y));
-        const label_t *row_labels = reinterpret_cast<const label_t *>(labels.ptr(y));
-        for (int x = 0; x < labels.cols; x++) {
-            const label_t &label = row_labels[x];
-            centroidsi[label] += row_img[x];
-            count[label]++;
-        }
+        dst[idx_dst + 0] -= src[idx_src + 0];
+        dst[idx_dst + 1] -= src[idx_src + 1];
+        dst[idx_dst + 2] -= src[idx_src + 2];
     }
-
-    for (int i = 0; i < k; i++) {
-        if (count[i])
-            centroidsb[i] = centroidsi[i] / count[i];
-        else // centroid is already taken, create a random new one
-            centroidsb[i] = img.at<Vec3b>(rand() % (img.cols * img.rows));
-    }
-
-    centroids_.upload(centroidsb);
 }
+
+__global__ void transition_add_retrieve (const uchar *src, uint *dst, uchar *img, const int pitch_src, const int pitch_dst, const int pitch_img, const int width, const int height, const int count) {
+    const int row  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (col < width & row < height) {
+        const int idx_src = row * pitch_src + col * 3;
+        const int idx_dst = row * pitch_dst + col * 3;
+        const int idx_img = row * pitch_img + col * 3;
+
+        dst[idx_dst + 0] += src[idx_src + 0];
+        dst[idx_dst + 1] += src[idx_src + 1];
+        dst[idx_dst + 2] += src[idx_src + 2];
+
+        img[idx_img + 0] = dst[idx_dst + 0] / count;
+        img[idx_img + 1] = dst[idx_dst + 1] / count;
+        img[idx_img + 2] = dst[idx_dst + 2] / count;
+    }
+}
+
+// CUDA WRAPPERS //
+namespace kmeans {
+    inline void label(const cu::Image &img, cu::Image &labels, const cu::Vector<cv::Vec3b> &centroids, const int &k) {
+        const dim3 dimGrid((img.width + dimBlock.x - 1) / dimBlock.x, (img.height + dimBlock.y - 1) / dimBlock.y);
+        label_pixels <<< dimGrid, dimBlock, k * sizeof(uchar3) >>> (img.p(), img.width, img.height, img.pitch(), centroids.p<uchar3>(), k, labels.p<label_t>(), labels.pitch<label_t>());
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+
+    void compute_centroid_cpu(const Mat &img, const cu::Image &labels_, cu::Vector<cv::Vec3b> &centroids_, const int &k) {
+        const Mat labels = labels_.download();
+        std::vector<Vec3i> centroidsi(k);
+        std::vector<Vec3b> centroidsb(k);
+        std::vector<int> count(k);
+
+        // omp seem to only improve ~15% in local tests, not worth it considering vs image loading
+        //#pragma omp parallel for reduction(vec_int3_plus : centroidsi), reduction(vec_int_plus : count)
+        for (int y = 0; y < labels.rows; y++) {
+            const Vec3b *row_img = reinterpret_cast<const Vec3b *>(img.ptr(y));
+            const label_t *row_labels = reinterpret_cast<const label_t *>(labels.ptr(y));
+            for (int x = 0; x < labels.cols; x++) {
+                const label_t &label = row_labels[x];
+                centroidsi[label] += row_img[x];
+                count[label]++;
+            }
+        }
+
+        for (int i = 0; i < k; i++) {
+            if (count[i])
+                centroidsb[i] = centroidsi[i] / count[i];
+            else // centroid is already taken, create a random new one
+                centroidsb[i] = img.at<Vec3b>(rand() % img.rows, rand() % img.cols);
+        }
+
+        centroids_.upload(centroidsb);
+    }
+}
+
+namespace dominant {
+    inline void scale_subtract(const cu::Image &labels, cu::Image &dominant, const int &k) {
+        const float f_width = labels.width / (float)dominant.width;
+        const float f_height = labels.height / (float)dominant.height;
+        const dim3 dimGrid((dominant.width + dimBlock.x - 1) / dimBlock.x, (dominant.height + dimBlock.y - 1) / dimBlock.y);
+        scale_dominant_subtract <<< dimGrid, dimBlock >>> (labels.p<label_t>(), dominant.p<uint>(), labels.pitch<label_t>(), dominant.pitch<uint>(), dominant.width, dominant.height, f_width, f_height, k);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+
+    inline void scale_add(const cu::Image &labels, cu::Image &dominant, const int &k) {
+        const float f_width = labels.width / (float)dominant.width;
+        const float f_height = labels.height / (float)dominant.height;
+        const dim3 dimGrid((dominant.width + dimBlock.x - 1) / dimBlock.x, (dominant.height + dimBlock.y - 1) / dimBlock.y);
+        scale_dominant_add <<<dimGrid, dimBlock>>>(labels.p<label_t>(), dominant.p<uint>(), labels.pitch<label_t>(), dominant.pitch<uint>(), dominant.width, dominant.height, f_width, f_height, k);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+
+    inline void retrieve(cu::Image &dom_img, cu::Image &dominant, const cu::Vector<cv::Vec3b> &centroids, const int &k, const int &swap_pos) {
+        const dim3 dimGrid((dominant.width + dimBlock.x - 1) / dimBlock.x, (dominant.height + dimBlock.y - 1) / dimBlock.y);
+        retrieve_result_dominant2 <<< dimGrid, dimBlock >>> (dom_img.p(), dominant.p<uint>(), centroids.p(), dom_img.pitch(), dominant.pitch<uint>(), dominant.width, dominant.height, k, swap_pos);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+}
+
+namespace transition {
+    inline void subtract(const cu::Image &prev_img, cu::Image &total_trans) {
+        const dim3 dimGrid((total_trans.width + dimBlock.x - 1) / dimBlock.x, (total_trans.height + dimBlock.y - 1) / dimBlock.y);
+        transition_subtract <<< dimGrid, dimBlock >>> (prev_img.p(), total_trans.p<uint>(), prev_img.pitch(), total_trans.pitch<uint>(), total_trans.width, total_trans.height);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+
+    inline void add_retrieve(const cu::Image &dom_img, cu::Image &total_trans, cu::Image &dom_trans_img, const int count) {
+        const dim3 dimGrid((total_trans.width + dimBlock.x - 1) / dimBlock.x, (total_trans.height + dimBlock.y - 1) / dimBlock.y);
+        transition_add_retrieve <<< dimGrid, dimBlock >>> (dom_img.p(), total_trans.p<uint>(), dom_trans_img.p(), dom_img.pitch(), total_trans.pitch<uint>(), dom_trans_img.pitch(), total_trans.width, total_trans.height, count);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+}
+
+///////////////////////////////////
 
 vector<Vec3b> cuda_kmeans(const Mat &img_, const int k, const int iterations) {
     vector<Vec3b> centroids_(k);
@@ -229,13 +311,9 @@ vector<Vec3b> cuda_kmeans(const Mat &img_, const int k, const int iterations) {
     cu::Image labels(img.height, img.width, label_cvtype);
     cu::Vector<cv::Vec3b> centroids(centroids_);
 
-    const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
-    const dim3 dimGrid((img.width + dimBlock.x - 1) / dimBlock.x, (img.height + dimBlock.y - 1) / dimBlock.y);
-
     for (int i = 0; i < iterations; i++) {
-        label_pixels <<< dimGrid, dimBlock, k * sizeof(uchar3) >>> (img.p(), img.width, img.height, img.pitch(), (const uchar3 *) centroids.p(), k, (label_t *) labels.p(), labels.pitch() / sizeof(label_t));
-        CUDA_CHECK_RETURN(cudaPeekAtLastError());
-        compute_centroid_cpu(img_, labels, centroids, k);
+        kmeans::label(img, labels, centroids, k);
+        kmeans::compute_centroid_cpu(img_, labels, centroids, k);
     }
     return centroids.download();
 }
@@ -267,8 +345,6 @@ void dominant_colour::computeDominant(const vector<string> &files, const vector<
 
     cu::Image dominant(1080 / 2, 1920 / 2, CV_32SC(k), true);
     cu::Image dom_img(dominant.height, dominant.width, CV_8UC3);
-    const dim3 dimBlock2(BLOCK_SIZE, BLOCK_SIZE, 1);
-    const dim3 dimGrid2((dominant.width + dimBlock2.x - 1) / dimBlock2.x, (dominant.height + dimBlock2.y - 1) / dimBlock2.y);
 
 #pragma omp parallel for ordered schedule(dynamic)
     for (int i = 0; i < files.size(); i++) {
@@ -282,26 +358,16 @@ void dominant_colour::computeDominant(const vector<string> &files, const vector<
             cu::Image img(img_);
             cu::Image labels(img.height, img.width, label_cvtype);
 
-            const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
-            const dim3 dimGrid((img.width + dimBlock.x - 1) / dimBlock.x, (img.height + dimBlock.y - 1) / dimBlock.y);
-
-            label_pixels <<< dimGrid, dimBlock, k * sizeof(uchar3) >>> (img.p(), img.width, img.height, img.pitch(), (const uchar3 *) centroids.p(), k, (label_t *) labels.p(), labels.pitch() / sizeof(label_t));
-            CUDA_CHECK_RETURN(cudaPeekAtLastError());
-
-            const float f_width = img.width / (float)dominant.width;
-            const float f_height = img.height / (float)dominant.height;
-            scale_dominant_add <<<dimGrid2, dimBlock2>>>((label_t *)labels.p(), (uint *)dominant.p(), labels.pitch() / sizeof(label_t), dominant.pitch() / sizeof(uint), dominant.width, dominant.height, f_width, f_height, k);
-            CUDA_CHECK_RETURN(cudaPeekAtLastError());
+            kmeans::label(img, labels, centroids, k);
+            dominant::scale_add(labels, dominant, k);
 
             // show intermediate results
             if (omp_get_thread_num() == 0) {
                 static int frame_count = 0;
                 frame_count++;
                 if (frame_count%1==0) {
-
 //                    boost::timer::cpu_timer watch;
-                    retrieve_result_dominant2 <<< dimGrid2, dimBlock2 >>> (dom_img.p(), (uint *) dominant.p(), centroids.p(), dom_img.pitch(), dominant.pitch() / sizeof(uint), dominant.width, dominant.height, k, swap_pos);
-                    CUDA_CHECK_RETURN(cudaPeekAtLastError());
+                    dominant::retrieve(dom_img, dominant, centroids, k, swap_pos);
 //                    cudaDeviceSynchronize();
 //                    cout << "done in " << watch.format() << endl;
 
@@ -319,17 +385,22 @@ void dominant_colour::computeDominant(const vector<string> &files, const vector<
     }
 }
 
+/* Compute the running-dominant color for 5000 frames
+ * On top of that, average results for the pas 100 frames
+ */
 void dominant_colour::computeDominantTemporal(const vector<string> &files, const vector<Vec3b> &centroids_, const int swap_pos) {
     const cu::Vector<cv::Vec3b> centroids(centroids_);
     const int k = centroids_.size();
     constexpr int temporal_size = 5000;
+    constexpr int transition_size = 100;
+    assert(k < 256);
 
     cu::Image dominant(1080 / 2, 1920 / 2, CV_32SC(k), true);
-    cu::Image dom_img(dominant.height, dominant.width, CV_8UC3);
-    const dim3 dimBlock2(BLOCK_SIZE, BLOCK_SIZE, 1);
-    const dim3 dimGrid2((dominant.width + dimBlock2.x - 1) / dimBlock2.x, (dominant.height + dimBlock2.y - 1) / dimBlock2.y);
+    cu::Image total_trans(dominant.height, dominant.width, CV_32SC3, true);
+    cu::Image dom_trans_img(dominant.height, dominant.width, CV_8UC3);
 
     vector<shared_ptr<cu::Image>> label_hist(temporal_size);
+    vector<shared_ptr<cu::Image>> dom_hist(transition_size);
 
 #pragma omp parallel for ordered schedule(dynamic)
     for (int i = 0; i < files.size(); i++) {
@@ -342,47 +413,50 @@ void dominant_colour::computeDominantTemporal(const vector<string> &files, const
                 cout << i << " / " << files.size() << endl;
 
             cu::Image img(img_);
-            if (i > temporal_size) {
+            if (i >= temporal_size) {
                 cu::Image &labels = *label_hist[temporal_idx];
-                const float f_width = labels.width / (float)dominant.width;
-                const float f_height = labels.height / (float)dominant.height;
-                scale_dominant_subtract <<< dimGrid2, dimBlock2 >>> ((label_t *) label_hist[temporal_idx]->p(), (uint *) dominant.p(), label_hist[temporal_idx]->pitch() / sizeof(label_t), dominant.pitch() / sizeof(uint), dominant.width, dominant.height, f_width, f_height, k);
-                CUDA_CHECK_RETURN(cudaPeekAtLastError());
+                dominant::scale_subtract(labels, dominant, k);
             }
             label_hist[temporal_idx] = make_shared<cu::Image>(img.height, img.width, label_cvtype);
             cu::Image &labels = *label_hist[temporal_idx];
 
-            const float f_width = img.width / (float)dominant.width;
-            const float f_height = img.height / (float)dominant.height;
-            const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
-            const dim3 dimGrid((img.width + dimBlock.x - 1) / dimBlock.x, (img.height + dimBlock.y - 1) / dimBlock.y);
+            kmeans::label(img, labels, centroids, k);
+            dominant::scale_add(labels, dominant, k);
 
-            label_pixels <<< dimGrid, dimBlock, k * sizeof(uchar3) >>> (img.p(), img.width, img.height, img.pitch(), (const uchar3 *) centroids.p(), k, (label_t *) labels.p(), labels.pitch() / sizeof(label_t));
-            CUDA_CHECK_RETURN(cudaPeekAtLastError());
-            scale_dominant_add <<<dimGrid2, dimBlock2>>>((label_t *)labels.p(), (uint *)dominant.p(), labels.pitch() / sizeof(label_t), dominant.pitch() / sizeof(uint), dominant.width, dominant.height, f_width, f_height, k);
-            CUDA_CHECK_RETURN(cudaPeekAtLastError());
-
-            // show intermediate results
+            // show results
             if (omp_get_thread_num() == 0) {
                 static int frame_count = 0;
-                frame_count++;
+                static int frame_nr = 0;
                 if (frame_count%1==0) {
+                    const int transition_idx = frame_nr % transition_size;
+                    if (frame_nr >= transition_size) {
+                        cu::Image &prev_img = *dom_hist[transition_idx];
+                        transition::subtract(prev_img, total_trans);
+                    } else {
+                        dom_hist[transition_idx] = make_shared<cu::Image>(dominant.height, dominant.width, CV_8UC3);
+                    }
+                    cu::Image &dom_img = *dom_hist[transition_idx];
 
 //                    boost::timer::cpu_timer watch;
-                    retrieve_result_dominant2 <<< dimGrid2, dimBlock2 >>> (dom_img.p(), (uint *) dominant.p(), centroids.p(), dom_img.pitch(), dominant.pitch() / sizeof(uint), dominant.width, dominant.height, k, swap_pos);
-                    CUDA_CHECK_RETURN(cudaPeekAtLastError());
+                    dominant::retrieve(dom_img, dominant, centroids, k, swap_pos);
 //                    cudaDeviceSynchronize();
 //                    cout << "done in " << watch.format() << endl;
 
-                    stringstream ss;
-                    ss << "../results/dominant/" << setfill('0') << setw(4) << frame_count << ".png";
+                    const int count = min(frame_nr+1, transition_size);
+                    transition::add_retrieve(dom_img, total_trans, dom_trans_img, count);
 
-                    const Mat frame = dom_img.download();
+                    stringstream ss;
+                    ss << "../results/dominant/" << setfill('0') << setw(5) << frame_nr << ".png";
+
+                    const Mat frame = dom_trans_img.download();
                     imshow("frame", frame);
                     imwrite(ss.str(), frame);
                     if (waitKey(1) == 27)
                         exit(0);
+
+                    frame_nr++;
                 }
+                frame_count++;
             }
         }
     }
@@ -395,7 +469,7 @@ Vec3b BGR2HSV(Vec3b &in) {
     return hsv.at<Vec3b>(0);
 }
 
-void dominant_colour::runCached(const std::string &cache_path) {
+void dominant_colour::runDominantExtaction(const std::string &cache_path) {
     cout << "retrieving cached file-list" << endl;
     BinReader reader(cache_path + "/" + cache_path_files);
     string cache_dst = reader.readString();
@@ -429,7 +503,7 @@ void dominant_colour::runCached(const std::string &cache_path) {
     computeDominantTemporal(files, global_means, skip_pos);
 }
 
-void dominant_colour::run(const std::string &path, const std::string &cache_path) {
+void dominant_colour::computeColors(const std::string &path, const std::string &cache_path) {
     vector<string> files = my_utils::listdir(path);
     {
         BinWriter writer(cache_path + "/" + cache_path_files);
@@ -457,6 +531,6 @@ void dominant_colour::run(const std::string &path, const std::string &cache_path
         writer.appendVector(global_means);
     }
 
-    cout << "running dominant extraction" << endl;
-    computeDominant(files, global_means, 0);
+//    cout << "running dominant extraction" << endl;
+//    computeDominant(files, global_means, 0);
 }
