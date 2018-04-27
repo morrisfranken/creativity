@@ -11,10 +11,10 @@
 #include <memory>
 #include <opencv2/core.hpp>
 
-#include "cudaUtils.h"
+#include "shared_pointer.h"
 
 namespace cu {
-	class Image : public cuSharedPointer {
+	class Image : public SharedPointer {
 		std::shared_ptr<Image> rgb = nullptr;    // is used for downloadAsRGB, and is kept as cache to avoid re-allocating
 
 		void malloc(int height, int width, int type, bool init_zero = false);

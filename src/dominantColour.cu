@@ -19,8 +19,10 @@
 
 #include "dominantColour.h"
 #include "average.h"
-#include "cuUtils/cuImage.h"
-#include "cuUtils/cuVector.h"
+#include "cu/image.h"
+#include "cu/vector.h"
+#include "cu/kmeans.h"
+#include "cu/utils.h"
 #include "utils/utils.h"
 #include "utils/binWriter.h"
 #include "utils/binReader.h"
@@ -28,75 +30,25 @@
 using namespace std;
 using namespace cv;
 
-typedef uchar label_t;  // change this based on K; K < 256 : uchar, K < 65536 : ushort
-constexpr int label_cvtype = CV_8U;// TODO(morris) should be dynamic based on ^  like cv::Mat_<label_t>().type()
-
 constexpr int BLOCK_SIZE = 32;
 constexpr char cache_path_files[]        = "files.raw";
 constexpr char cache_path_image_means[]  = "image_means.raw";
 constexpr char cache_path_global_means[] = "global_means.raw";
 
+#define SKIP_MARGIN 30
+constexpr int dom_margin = 1;
+constexpr int ext_block_size = BLOCK_SIZE + dom_margin * 2;
+constexpr int mem_limit = 49152 / (sizeof(int) * ext_block_size * ext_block_size); // 49152 is the amount of memory that fits in a block (for GTX_850M) TODO(morris) should make this dynamic somehow
+
 const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
 
-#pragma omp declare reduction(vec_int_plus  : std::vector<int>     : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<int>())) initializer(omp_priv = omp_orig)
-#pragma omp declare reduction(vec_int3_plus : std::vector<Vec3i>   : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<Vec3i>())) initializer(omp_priv = omp_orig)
-//#pragma omp declare reduction(arr_int_plus  : std::array<int, K>   : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<int>())) initializer(omp_priv = omp_orig)
-//#pragma omp declare reduction(arr_int3_plus : std::array<Vec3i, K> : std::transform(omp_out.begin(), omp_out.end(), omp_in.begin(), omp_out.begin(), std::plus<Vec3i>())) initializer(omp_priv = omp_orig)
-
-__global__ void label_pixels(const uchar *img, const int width, int height, const int pitch_img, const uchar3 *centroids, const int k, label_t *labels, const int pitch_labels) {
-    const int row  = blockIdx.y * blockDim.y + threadIdx.y;
-    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
-    const int tidx = threadIdx.y * BLOCK_SIZE + threadIdx.x;
-
-    extern __shared__ uchar3 sCentroid[]; // NOTE(morris) : size is equal to `k` and determined in calling function <<< grid, block, memsize >> (where memsize is in bytes)
-    if (tidx < k) {
-        sCentroid[tidx] = centroids[tidx]; // copy global centroids to local block memory
-    }
-    __syncthreads();
-
-    if (row < height & col < width) {	// make sure the thread is within the image
-        const int idx_img = row * pitch_img + col * 3;
-        const int idx_label = row * pitch_labels + col;
-
-        const uchar3 pix = *(uchar3 *)(img + idx_img);
-
-        int best_i = 0;
-        int best_val = 0x0fffffff;
-
-        // compute the closest centroid
-        for (int i = 0; i < k; i++) {
-            const auto &centroid = sCentroid[i];
-            const int dx = pix.x - centroid.x;
-            const int dy = pix.y - centroid.y;
-            const int dz = pix.z - centroid.z;
-            const int dist = dx*dx + dy*dy + dz*dz;
-//            printf("pix[%d,%d] :: [%d] [%d,%d,%d] -- [%d,%d,%d] = %d\n", row, col, i, pix.x, pix.y, pix.z, centroid.x, centroid.y, centroid.z, dist);
-            if (dist < best_val) {
-                best_val = dist;
-                best_i = i;
-            }
-        }
-        labels[idx_label] = (label_t)best_i;
-    }
+namespace dominant_colour {
+    cv::Mat computeImageMeans(const std::vector<std::string> &files, int k);
+    void computeDominant(const std::vector<std::string> &files, const std::vector<cv::Vec3b> &centroids_, int swap_pos);
+    void computeDominantTemporal(const std::vector<std::string> &files, const std::vector<cv::Vec3b> &centroids_, int swap_pos);
 }
 
-__global__ void retrieve_result_kmeans(uchar *img, const int width, int height, const int pitch_img, const uchar3 *centroids, const int k, const label_t *labels, const int pitch_labels) {
-    const int row  = blockIdx.y * blockDim.y + threadIdx.y;
-    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < height & col < width) {	// make sure the thread is within the image
-        const int idx_img = row * pitch_img + col * 3;
-        const int idx_label = row * pitch_labels + col;
-
-        const uchar3 &pix = centroids[labels[idx_label]];
-        img[idx_img + 0] = pix.x;
-        img[idx_img + 1] = pix.y;
-        img[idx_img + 2] = pix.z;
-
-    }
-}
-
-__global__ void scale_dominant_add(const label_t *labels, uint *dominant, const int pitch_labels, const int pitch_dominant, const int width_dominant, const int height_dominant, const float f_width, const float f_height, const int k) {
+__global__ void scale_dominant_add(const kmeans_label *labels, uint *dominant, const int pitch_labels, const int pitch_dominant, const int width_dominant, const int height_dominant, const float f_width, const float f_height, const int k) {
     const int row  = blockIdx.y * blockDim.y + threadIdx.y;
     const int col  = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -108,7 +60,7 @@ __global__ void scale_dominant_add(const label_t *labels, uint *dominant, const 
     }
 }
 
-__global__ void scale_dominant_subtract(const label_t *labels, uint *dominant, const int pitch_labels, const int pitch_dominant, const int width_dominant, const int height_dominant, const float f_width, const float f_height, const int k) {
+__global__ void scale_dominant_subtract(const kmeans_label *labels, uint *dominant, const int pitch_labels, const int pitch_dominant, const int width_dominant, const int height_dominant, const float f_width, const float f_height, const int k) {
     const int row  = blockIdx.y * blockDim.y + threadIdx.y;
     const int col  = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -126,10 +78,6 @@ __global__ void scale_dominant_subtract(const label_t *labels, uint *dominant, c
  * Once the memory is copied it will continue to compute the dominant colour for a given pixel adding all neighbouring dominant-counts to it
  *
  */
-#define SKIP_MARGIN 30
-constexpr int dom_margin = 1;
-constexpr int ext_block_size = BLOCK_SIZE + dom_margin * 2;
-constexpr int mem_limit = 49152 / (sizeof(int) * ext_block_size * ext_block_size); // 49152 is the amount of memory that fits in a block (for GTX_850M) TODO(morris) should make this dynamic somehow
 __global__ void retrieve_result_dominant2(uchar *img, const uint *dominant, const uchar *centroids, const int pitch_img, const int pitch_dominant, const int width, const int height, const int k, const int skip_idx) {
     const int row  = blockIdx.y * BLOCK_SIZE + threadIdx.y;
     const int col  = blockIdx.x * BLOCK_SIZE + threadIdx.x;
@@ -223,49 +171,12 @@ __global__ void transition_add_retrieve (const uchar *src, uint *dst, uchar *img
     }
 }
 
-// CUDA WRAPPERS //
-namespace kmeans {
-    inline void label(const cu::Image &img, cu::Image &labels, const cu::Vector<cv::Vec3b> &centroids, const int &k) {
-        const dim3 dimGrid((img.width + dimBlock.x - 1) / dimBlock.x, (img.height + dimBlock.y - 1) / dimBlock.y);
-        label_pixels <<< dimGrid, dimBlock, k * sizeof(uchar3) >>> (img.p(), img.width, img.height, img.pitch(), centroids.p<uchar3>(), k, labels.p<label_t>(), labels.pitch<label_t>());
-        CUDA_CHECK_RETURN(cudaPeekAtLastError());
-    }
-
-    void compute_centroid_cpu(const Mat &img, const cu::Image &labels_, cu::Vector<cv::Vec3b> &centroids_, const int &k) {
-        const Mat labels = labels_.download();
-        std::vector<Vec3i> centroidsi(k);
-        std::vector<Vec3b> centroidsb(k);
-        std::vector<int> count(k);
-
-        // omp seem to only improve ~15% in local tests, not worth it considering vs image loading
-        //#pragma omp parallel for reduction(vec_int3_plus : centroidsi), reduction(vec_int_plus : count)
-        for (int y = 0; y < labels.rows; y++) {
-            const Vec3b *row_img = reinterpret_cast<const Vec3b *>(img.ptr(y));
-            const label_t *row_labels = reinterpret_cast<const label_t *>(labels.ptr(y));
-            for (int x = 0; x < labels.cols; x++) {
-                const label_t &label = row_labels[x];
-                centroidsi[label] += row_img[x];
-                count[label]++;
-            }
-        }
-
-        for (int i = 0; i < k; i++) {
-            if (count[i])
-                centroidsb[i] = centroidsi[i] / count[i];
-            else // centroid is already taken, create a random new one
-                centroidsb[i] = img.at<Vec3b>(rand() % img.rows, rand() % img.cols);
-        }
-
-        centroids_.upload(centroidsb);
-    }
-}
-
 namespace dominant {
     inline void scale_subtract(const cu::Image &labels, cu::Image &dominant, const int &k) {
         const float f_width = labels.width / (float)dominant.width;
         const float f_height = labels.height / (float)dominant.height;
         const dim3 dimGrid((dominant.width + dimBlock.x - 1) / dimBlock.x, (dominant.height + dimBlock.y - 1) / dimBlock.y);
-        scale_dominant_subtract <<< dimGrid, dimBlock >>> (labels.p<label_t>(), dominant.p<uint>(), labels.pitch<label_t>(), dominant.pitch<uint>(), dominant.width, dominant.height, f_width, f_height, k);
+        scale_dominant_subtract <<< dimGrid, dimBlock >>> (labels.p<kmeans_label>(), dominant.p<uint>(), labels.pitch<kmeans_label>(), dominant.pitch<uint>(), dominant.width, dominant.height, f_width, f_height, k);
         CUDA_CHECK_RETURN(cudaPeekAtLastError());
     }
 
@@ -273,7 +184,7 @@ namespace dominant {
         const float f_width = labels.width / (float)dominant.width;
         const float f_height = labels.height / (float)dominant.height;
         const dim3 dimGrid((dominant.width + dimBlock.x - 1) / dimBlock.x, (dominant.height + dimBlock.y - 1) / dimBlock.y);
-        scale_dominant_add <<<dimGrid, dimBlock>>>(labels.p<label_t>(), dominant.p<uint>(), labels.pitch<label_t>(), dominant.pitch<uint>(), dominant.width, dominant.height, f_width, f_height, k);
+        scale_dominant_add <<<dimGrid, dimBlock>>>(labels.p<kmeans_label>(), dominant.p<uint>(), labels.pitch<kmeans_label>(), dominant.pitch<uint>(), dominant.width, dominant.height, f_width, f_height, k);
         CUDA_CHECK_RETURN(cudaPeekAtLastError());
     }
 
@@ -300,24 +211,6 @@ namespace transition {
 
 ///////////////////////////////////
 
-vector<Vec3b> cuda_kmeans(const Mat &img_, const int k, const int iterations) {
-    vector<Vec3b> centroids_(k);
-
-    for (int i = 0; i < k; i++) {
-        centroids_[i] = img_.at<Vec3b>(rand() % img_.rows, rand() % img_.cols); // TODO(morris) :: pick better initial random centers
-    }
-
-    cu::Image img(img_);
-    cu::Image labels(img.height, img.width, label_cvtype);
-    cu::Vector<cv::Vec3b> centroids(centroids_);
-
-    for (int i = 0; i < iterations; i++) {
-        kmeans::label(img, labels, centroids, k);
-        kmeans::compute_centroid_cpu(img_, labels, centroids, k);
-    }
-    return centroids.download();
-}
-
 cv::Mat dominant_colour::computeImageMeans(const vector<string> &files, const int k) {
     Mat means = Mat(files.size(), k, CV_8UC3);
 
@@ -330,7 +223,7 @@ cv::Mat dominant_colour::computeImageMeans(const vector<string> &files, const in
             if (i % 100 == 0)
                 cout << i << " / " << files.size() << endl;
 
-            const auto image_means = cuda_kmeans(img, k, 5);
+            const auto image_means = cu::kmeans(img, k, 5);
             mempcpy(means.ptr(i), image_means.data(), means.step);
         }
     }
@@ -338,6 +231,7 @@ cv::Mat dominant_colour::computeImageMeans(const vector<string> &files, const in
     return means;
 }
 
+// @deprecated : use computeDominantTemporal
 void dominant_colour::computeDominant(const vector<string> &files, const vector<Vec3b> &centroids_, const int swap_pos) {
     const cu::Vector<cv::Vec3b> centroids(centroids_);
     const int k = centroids_.size();
@@ -358,7 +252,7 @@ void dominant_colour::computeDominant(const vector<string> &files, const vector<
             cu::Image img(img_);
             cu::Image labels(img.height, img.width, label_cvtype);
 
-            kmeans::label(img, labels, centroids, k);
+            cu::label(img, labels, centroids, k);
             dominant::scale_add(labels, dominant, k);
 
             // show intermediate results
@@ -392,8 +286,8 @@ void dominant_colour::computeDominantTemporal(const vector<string> &files, const
     const cu::Vector<cv::Vec3b> centroids(centroids_);
     const int k = centroids_.size();
     constexpr int temporal_size = 5000;
-    constexpr int transition_size = 100;
-    assert(k < 256);
+    constexpr int transition_size = 100; // fade-frames
+    assert(k < 256); // since label is uchar (efficient memory consumption)
 
     cu::Image dominant(1080 / 2, 1920 / 2, CV_32SC(k), true);
     cu::Image total_trans(dominant.height, dominant.width, CV_32SC3, true);
@@ -420,7 +314,7 @@ void dominant_colour::computeDominantTemporal(const vector<string> &files, const
             label_hist[temporal_idx] = make_shared<cu::Image>(img.height, img.width, label_cvtype);
             cu::Image &labels = *label_hist[temporal_idx];
 
-            kmeans::label(img, labels, centroids, k);
+            cu::label(img, labels, centroids, k);
             dominant::scale_add(labels, dominant, k);
 
             // show results
@@ -524,13 +418,13 @@ void dominant_colour::computeColors(const std::string &path, const std::string &
     }
 
     cout << "computing global means" << endl;
-    const vector<Vec3b> global_means = cuda_kmeans(means, 256, 50);
+    const vector<Vec3b> global_means = cu::kmeans(means, 256, 50);
 
     {
         BinWriter writer(cache_path + "/" + cache_path_global_means);
         writer.appendVector(global_means);
     }
 
-//    cout << "running dominant extraction" << endl;
-//    computeDominant(files, global_means, 0);
+    cout << "running dominant extraction" << endl;
+    computeDominantTemporal(files, global_means, 0);
 }

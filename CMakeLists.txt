@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 11)
 file(GLOB_RECURSE sources src/*.cpp src/*.cu)
 file(GLOB_RECURSE headers src/*.h)
 
-add_executable(${PROJECT_NAME} ${sources} ${headers} src/dominantTransition.cu src/dominantTransition.h)
+add_executable(${PROJECT_NAME} ${sources} ${headers} src/eigenArt.cu src/eigenArt.h src/cu/kmeans.cu src/cu/kmeans.h src/cu/shared_pointer.cu src/cu/shared_pointer.h)
 #set_property(TARGET ${PROJECT_NAME} PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 set_property(TARGET ${PROJECT_NAME} PROPERTY CUDA_STANDARD 11)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")

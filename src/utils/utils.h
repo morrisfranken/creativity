@@ -7,9 +7,11 @@
 
 #include <vector>
 #include <string>
+#include <opencv2/core/mat.hpp>
 
 namespace my_utils {
     std::vector<std::string> listdir(const std::string &path);
+    void saveMat(const std::string &path, cv::Mat &m);
 };
 
 

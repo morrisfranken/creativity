@@ -6,6 +6,7 @@
 #include <dirent.h>
 
 #include "utils.h"
+#include "binWriter.h"
 
 using namespace std;
 
@@ -25,4 +26,9 @@ vector<string> my_utils::listdir(const std::string &path) {
     }
 
     return files;
+}
+
+void my_utils::saveMat(const std::string &path, cv::Mat &m) {
+    BinWriter writer(path);
+    writer.appendMat(m);
 }

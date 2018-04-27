@@ -14,7 +14,8 @@
 #include <boost/timer/timer.hpp>
 
 #include "average.h"
-#include "cuUtils/cuImage.h"
+#include "cu/image.h"
+#include "cu/utils.h"
 #include "utils/utils.h"
 
 using namespace std;
@@ -35,12 +36,11 @@ __global__ void scale_add(unsigned char *in, float *res, const int pitch_in, con
 
 void average::run(const std::string &path) {
     const vector<string> files = my_utils::listdir(path);
-	cv::Mat total_ = cv::Mat::zeros(1080/2, 1920/2, CV_32FC3);
-	cu::Image gputotal(total_);
+	cu::Image total(1080/2, 1920/2, CV_32FC3, true);
 
 	constexpr int BLOCK_SIZE = 32;
 	const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
-	const dim3 dimGrid((gputotal.width + dimBlock.x - 1) / dimBlock.x, (gputotal.height + dimBlock.y - 1) / dimBlock.y);
+	const dim3 dimGrid((total.width + dimBlock.x - 1) / dimBlock.x, (total.height + dimBlock.y - 1) / dimBlock.y);
 
     boost::timer::cpu_timer watch;
 	#pragma omp parallel for ordered schedule(dynamic)
@@ -53,9 +53,9 @@ void average::run(const std::string &path) {
 				cout << i << " / " << files.size() << endl;
 
 			cu::Image gpuimg(img);
-			const float f_width = gpuimg.width / (float)gputotal.width;
-			const float f_height = gpuimg.height / (float)gputotal.height;
-			scale_add<<<dimGrid, dimBlock>>>(gpuimg.p(), gputotal.p<float>(), gpuimg.pitch(), gputotal.pitch<float>(), gputotal.width, gputotal.height, f_width, f_height);
+			const float f_width = gpuimg.width / (float)total.width;
+			const float f_height = gpuimg.height / (float)total.height;
+			scale_add<<<dimGrid, dimBlock>>>(gpuimg.p(), total.p<float>(), gpuimg.pitch(), total.pitch<float>(), total.width, total.height, f_width, f_height);
             CUDA_CHECK_RETURN(cudaPeekAtLastError());
 
 			if (omp_get_thread_num() == 0) {
@@ -63,7 +63,7 @@ void average::run(const std::string &path) {
 				show_count++;
                 if (show_count%10==0) {
                     const float multiplier = 1.0f / (float)(i+1);
-                    Mat res = gputotal.downloadAsRGB(multiplier);
+                    Mat res = total.downloadAsRGB(multiplier);
                     imshow("frame", res);
                     if (waitKey(1) == 27)
                         exit(0);
@@ -74,7 +74,7 @@ void average::run(const std::string &path) {
     cout << "done in " << watch.format() << endl;
 
     const float multiplier = 1.0f / (float)(files.size());
-    Mat res = gputotal.downloadAsRGB(multiplier);
+    Mat res = total.downloadAsRGB(multiplier);
 	imshow("frame", res);
 	imwrite("average.png", res);
 	waitKey();
