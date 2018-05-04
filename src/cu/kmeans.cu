@@ -103,6 +103,7 @@ __global__ void compute_totals(const uchar *img, const int width, int height, co
 
     __syncthreads();
 
+    // potential speedup; reserve global memory for every block to store `local_centroid_count`, and perform a sum in the end over all these arrays to avoid the atomicAdd
     if (tidx < k*4) { // this will be a problem for k > 256
         atomicAdd(global_centroid_count + tidx, local_centroid_count[tidx]);
     }
@@ -120,7 +121,9 @@ __global__ void compute_centroids(uint *global_centroid_count, uchar *centroids)
         centroids[threadIdx.x * 3 + 1] = roundi(global_centroid_count[threadIdx.x * 4 + 1], count);
         centroids[threadIdx.x * 3 + 2] = roundi(global_centroid_count[threadIdx.x * 4 + 2], count);
     } else {
-
+        centroids[threadIdx.x * 3 + 0] += threadIdx.x; // not really random... but close enough for this purpose
+        centroids[threadIdx.x * 3 + 1] += threadIdx.x;
+        centroids[threadIdx.x * 3 + 2] += threadIdx.x;
     }
 }
 

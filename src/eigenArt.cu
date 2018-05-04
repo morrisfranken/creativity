@@ -16,6 +16,7 @@
 #include "utils/utils.h"
 #include "cu/image.h"
 #include "cu/utils.h"
+#include "cu/vector.h"
 
 using namespace std;
 using namespace cv;
@@ -23,6 +24,9 @@ using namespace cv;
 constexpr int BLOCK_SIZE = 32;
 const dim3 dimBlock(BLOCK_SIZE, BLOCK_SIZE, 1);
 
+#define TESTINGS false
+
+#if TESTINGS
 namespace d {
     __global__ void
     scale_add(unsigned char *in, float *res, const int pitch_in, const int pitch_res, const int width_res, const int height_res, const float f_width, const float f_height) {
@@ -49,9 +53,10 @@ namespace d {
             const int idx_mean = row * pitch_mean + col * 3;
             const int idx_in   = int(f_height * row) * pitch_in + int(f_width * col) * 3;
 
-            for (int chan = 0; chan < 3; chan++)
-                const float diff = (float) in[idx_in + chan] - mean[idx_mean + chan]
+            for (int chan = 0; chan < 3; chan++) {
+                const float diff = (float) in[idx_in + chan] - mean[idx_mean + chan];
                 res[idx_res + chan] += diff * diff;
+            }
         }
     }
 
@@ -137,7 +142,7 @@ namespace eigen_art {
     }
 }
 
-// TODO(morris) : actually use optimized pca for eigen vector extraction instead of this.
+ TODO(morris) : actually use optimized pca for eigen vector extraction instead of this.
 void eigen_art::run(const std::string &path, const std::string &cache_path) {
     const vector<string> files = my_utils::listdir(path);
     const float multiplier = 1.0f / (float)(files.size());
@@ -184,4 +189,118 @@ void eigen_art::run(const std::string &path, const std::string &cache_path) {
     }
     cout << "done in " << watch.format() << endl;
 
+}
+#endif
+
+// CUDA covariance
+// covariance can be computed sequentially, which is perfect for cuda. This function should accomplish the following:
+// - scale
+// - subtract mean
+// - store intermediate value
+// ----- new function ----------
+// - compute covariance with itself
+// - add to existing covariance matrix
+// Dont forget to multiply with `1 / (n-1)` at the very end!
+// https://docs.opencv.org/2.4/modules/contrib/doc/facerec/facerec_tutorial.html
+// https://docs.opencv.org/3.1.0/d1/dee/tutorial_introduction_to_pca.html
+
+__global__ void eigen_scale_subtract_mean(const uchar *img, const uchar *mean, short *result, const int pitch_img, int pitch_mean, const int p, const int width, const int height, const float f_width, const float f_height) {
+    const int row  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < height & col < width) {	// make sure the thread is within the image
+        const int idx_mean = row * pitch_mean + col * 3;
+        const int idx_res  = row * p + col * 3;
+        const int idx_img  = int(f_height * row) * pitch_img + int(f_width * col) * 3;
+
+        result[idx_res + 0] = (short)img[idx_img + 0] - (short)mean[idx_mean + 0];
+        result[idx_res + 1] = (short)img[idx_img + 1] - (short)mean[idx_mean + 1];
+        result[idx_res + 2] = (short)img[idx_img + 2] - (short)mean[idx_mean + 2];
+    }
+}
+
+__global__ void eigen_add_covariance(const short *B, unsigned long *C, const int pitch_C, const int p) {
+    const int row  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < p & col < p) {
+        const int idx_cov = row * pitch_C + col * 3;
+
+        C[idx_cov + 0] += B[row * 3 + 0] * B[col * 3 + 0];
+        C[idx_cov + 1] += B[row * 3 + 1] * B[col * 3 + 1];
+        C[idx_cov + 2] += B[row * 3 + 2] * B[col * 3 + 2];
+    }
+}
+
+namespace eigen_art {
+    void scale_subtract_mean(const cu::Image &img, const cu::Image &mean, cu::Vector<short> &B) {
+        const float f_width = img.width / (float)mean.width;
+        const float f_height = img.height / (float)mean.height;
+        const dim3 dimGrid((mean.width + dimBlock.x - 1) / dimBlock.x, (mean.height + dimBlock.y - 1) / dimBlock.y);
+
+        eigen_scale_subtract_mean<<<dimGrid, dimBlock>>>(img.p(), mean.p(), B.p<short>(), img.pitch(), mean.pitch(), (int)B.size, mean.width, mean.height, f_width, f_height);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+
+    void add_covariance(cu::Image &C, const cu::Vector<short> &B) {
+        const dim3 dimGrid((B.size + dimBlock.x - 1) / dimBlock.x, (B.size + dimBlock.y - 1) / dimBlock.y);
+
+        eigen_add_covariance<<<dimGrid, dimBlock>>>(B.p<short>(), C.p<unsigned long>(), C.pitch<unsigned long>(), B.size);
+        CUDA_CHECK_RETURN(cudaPeekAtLastError());
+    }
+}
+////////////////
+
+
+Mat normMatf(Mat img) {
+    float minVal = INFINITY, maxVal=-INFINITY;
+    for (int y = 0; y < img.rows; y++) {
+        const Vec3f *row = (Vec3f *)img.ptr(y);
+        for (int x = 0; x < img.cols; x++) {
+            const Vec3f &p = row[x];
+            if (p[0] < minVal) minVal = p[0];
+            if (p[1] < minVal) minVal = p[1];
+            if (p[2] < minVal) minVal = p[2];
+
+            if (p[0] > maxVal) maxVal = p[0];
+            if (p[1] > maxVal) maxVal = p[1];
+            if (p[2] > maxVal) maxVal = p[2];
+        }
+    }
+
+    Mat res;
+    img.convertTo(res, CV_8UC3, 255.0/(maxVal - minVal), -minVal * 255.0/(maxVal - minVal));
+    return res;
+}
+
+void eigen_art::run(const std::string &path, const std::string &cache_path) {
+    const vector<string> files = my_utils::listdir(path);
+    Size size(1920/4, 1080/4);
+
+    string pca_path = cache_path + "/pca";
+    boost::filesystem::create_directory(pca_path);
+
+    vector<Mat> images(files.size());
+    Mat data(0, size.width * size.height, CV_8UC3);
+    cout << "loading images" << endl;
+    for (size_t i = 0; i < files.size(); i++) {
+        Mat img = imread(files[i]);
+        cv::resize(img, img, size);
+        images[i] = img.reshape(1,1); // flatten
+        data.push_back(images[i]);
+    }
+
+    cout << "computing pca: " << data.size() << endl;
+    PCA pca(data, Mat(), CV_PCA_DATA_AS_ROW, 10);
+    Mat averageFace = pca.mean.reshape(3,size.height);
+    imwrite("average_pca.png", averageFace);
+
+    vector<Mat> eigen_images;
+    for(int i = 0; i < 10; i++) {
+        Mat eigenFace = pca.eigenvectors.row(i).reshape(3,size.height);
+        cout <<  "i = " << i << " :: " << eigenFace.size() << endl;
+        eigen_images.push_back(eigenFace);
+        my_utils::saveMat(pca_path + "/" + std::to_string(i) + ".raw", eigenFace);
+        imwrite(pca_path + "/" + std::to_string(i) + ".png", normMatf(eigenFace));
+    }
 }

@@ -12,6 +12,7 @@
 namespace my_utils {
     std::vector<std::string> listdir(const std::string &path);
     void saveMat(const std::string &path, cv::Mat &m);
+    cv::Mat loadMat(const std::string &path);
 };
 
 

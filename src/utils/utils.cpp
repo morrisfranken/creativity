@@ -7,6 +7,7 @@
 
 #include "utils.h"
 #include "binWriter.h"
+#include "binReader.h"
 
 using namespace std;
 
@@ -31,4 +32,10 @@ vector<string> my_utils::listdir(const std::string &path) {
 void my_utils::saveMat(const std::string &path, cv::Mat &m) {
     BinWriter writer(path);
     writer.appendMat(m);
+}
+
+
+cv::Mat my_utils::loadMat(const std::string &path) {
+    BinReader reader(path);
+    return reader.readMat();
 }

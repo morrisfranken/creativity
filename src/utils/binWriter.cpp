@@ -7,6 +7,7 @@
 
 #include <opencv2/imgcodecs/imgcodecs_c.h>
 #include <opencv2/imgcodecs.hpp>
+#include <iostream>
 
 #include "binWriter.h"
 
@@ -49,7 +50,9 @@ void BinWriter::appendMat(const Mat &mat) {
 	uint32_t type = temp.type();
 	uint32_t rows = temp.rows;
 	uint32_t cols = temp.cols;
-	uint32_t sizeofMat = (temp.dataend - temp.data);
+	const Mat dummy = Mat(1,1,type);
+	const int elem_size = dummy.dataend - dummy.data; // for instances where this mat is inside another mat (but still continious)
+	uint32_t sizeofMat = elem_size * rows * cols;//(temp.dataend - temp.data);
 
 	appendInt32(type);
 	appendInt32(rows);
